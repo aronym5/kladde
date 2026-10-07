@@ -1,0 +1,27 @@
+[package]
+name = "kladde"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Kladde - a PDF viewer with swipe control for wayland"
+license = "AGPL-3.0-or-later"
+build = "build.rs"
+publish = false
+
+[lib]
+name = "kladde"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kladde"
+path = "src/bin/kladde.rs"
+
+# Deliberately no dependencies. The C shim is compiled directly from build.rs
+# compiled; that is necessary anyway for a project with cross-compilation
+# (CC points to the cross toolchain) and keeps the build offline-capable.
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+debug = true

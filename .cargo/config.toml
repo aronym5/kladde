@@ -1,0 +1,12 @@
+# Kladde wird in dieser Entwicklungsphase gegen die MuPDF-Bibliothek der
+# Distribution gelinkt, also dynamisch. Ohne das setzen musl-Ziele per
+# Default crt-static, und ein statisch gelinktes Binary kann eine shared
+# libmupdf gar nicht laden - es stuerzt beim ersten Aufruf ab. build.rs
+# erkennt diese Einstellung ueber CARGO_ENCODED_RUSTFLAGS, auch wenn sie
+# hier statt in der Umgebung steht.
+#
+# Fuer einen statischen Build (empfohlen fuer das fertige Geraet, weil
+# Kladde dann eine einzige Datei ist) einfach diese Datei loeschen und
+# libmupdf.a bereitstellen - build.rs nimmt sie dann von selbst.
+[build]
+rustflags = ["-C", "target-feature=-crt-static"]
