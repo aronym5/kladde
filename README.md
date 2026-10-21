@@ -36,6 +36,8 @@ curl -sSL https://aronym5.github.io/kladde/install.sh | sh
 - Rubber band at the document start/end
 - Fast page turns on any hardware: the heavy raster work is done ahead of
   time in a background thread
+- The screen stays awake as long as kladde is the active window: a page
+  that is being read does not dim away
 
 ## Fast page turns
 
@@ -147,8 +149,6 @@ KLADDE_WAYLAND=stub cargo check       # window left out, only a warning
   --store MB       MuPDF store per context, default 16
   --alpha 0|1      4 bytes/pixel (1) or 3 bytes/pixel (0), default 1
   --quiet          Only errors to stderr
-  --verbose        Additionally the step-by-step trace
-                   (every event, every frame)
   -h, --help
 ```
 

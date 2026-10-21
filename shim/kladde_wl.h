@@ -9,8 +9,10 @@
  * WHAT THIS FILE DOES (and what not):
  * It makes a window, allocates two XRGB8888 buffers, commits them with
  * damage rectangle and hands touch, mouse, keyboard and the compositor's
- * presentation time outwards. It draws nothing and knows nothing about
- * PDF, pages or scheduling.
+ * presentation time outwards. While the window is in the foreground - the
+ * active one, or the one with the keyboard focus - it also asks the
+ * compositor not to dim or blank the screen. It draws nothing and knows
+ * nothing about PDF, pages or scheduling.
  *
  * WHY XRGB8888:
  * That is exactly MuPDF's `fz_device_bgr` layout (little-endian, X in the
@@ -133,6 +135,15 @@ int kl_wl_is_fullscreen(const kl_wl *w);
 int kl_wl_has_touch(const kl_wl *w);
 int kl_wl_has_pointer(const kl_wl *w);
 int kl_wl_has_keyboard(const kl_wl *w);
+
+/* Is the screen kept from dimming, blanking or locking itself right
+ * now? The shim asks for exactly that while the window is in the
+ * foreground (zwp_idle_inhibit_manager_v1): the active window or the
+ * one with the keyboard focus, see update_idle_inhibit(). 0 means "no":
+ * either the compositor does not offer the protocol, or the window is
+ * not in front - the display then behaves as usual. Which of the two it
+ * is, says kl_wl_want(w, "zwp_idle_inhibit_manager_v1", ...). */
+int kl_wl_idle_inhibited(const kl_wl *w);
 
 /* Reason for the last error, or "" . */
 const char *kl_wl_last_error(kl_wl *w);

@@ -35,7 +35,6 @@ struct Args {
     store_mb: usize,
     alpha: bool,
     quiet: bool,
-    verbose: bool,
     fullscreen: bool,
 }
 
@@ -48,23 +47,12 @@ impl Default for Args {
             store_mb: 16,
             alpha: true,
             quiet: false,
-            verbose: false,
             fullscreen: false,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum InputMode {
-    Desktop,
-    Hybrid,
-    TabletOnly,
-}
-
 struct InputState {
-    mode: InputMode,
-    last_input_ms: f64,
-    kb_was_present: bool,
     /// Was Kladde **will**: steht das Fenster im Vollbild? (Der Compositor
     /// antwortet erst mit seinem nächsten `configure`; ein Tipp muss sofort
     /// etwas bewirken.)
@@ -73,32 +61,13 @@ struct InputState {
     /// gefragt. Nur wenn sich sein Stand gegenüber dem zuletzt bestätigten
     /// geändert hat, wurde er von ausserhalb entschieden.
     fullscreen_confirmed: Option<bool>,
-    /// Steht das Fenster im Vollbild, und **woher** kam das? Beim Anstecken
-    /// einer Tastatur darf nur der Komfort (Auto) verschwinden, nicht der
-    /// Wunsch (Aufruf/Menü).
-    fullscreen_origin: Option<Origin>,
-    /// `--fullscreen` stand in der Kommandozeile — ein Startzustand, kein
-    /// fester Wunsch. Sobald der Nutzer das Vollbild über das Menü ändert,
-    /// wird diese Kennung discarded.
-    fullscreen_explicit: bool,
-    last_caps_t: bool,
-    last_caps_p: bool,
-    last_caps_k: bool,
 }
 
 impl Default for InputState {
     fn default() -> Self {
         InputState {
-            mode: InputMode::Desktop,
-            last_input_ms: 0.0,
-            kb_was_present: false,
             fullscreen: false,
             fullscreen_confirmed: None,
-            fullscreen_origin: None,
-            fullscreen_explicit: false,
-            last_caps_t: false,
-            last_caps_p: false,
-            last_caps_k: false,
         }
     }
 }
@@ -128,8 +97,6 @@ Options
   --store MB       MuPDF store per context, default 16
   --alpha 0|1      4 bytes/pixel (1) or 3 bytes/pixel (0), default 1
   --quiet          Only errors to stderr
-  --verbose        Additionally the step-by-step trace
-                   (every event, every frame)
   -h, --help
 
 Without options a window opens, and that needs a Wayland session
@@ -148,10 +115,6 @@ With mouse
   Left click       one page back       (right third: forward)
   Middle click     nothing, the third applies
   Right mouse      menu: toggle fullscreen
-Fullscreen
-  After 20 s without input and without keyboard the window goes
-  fullscreen by itself; when a keyboard is plugged in it goes back -
-  unless the invocation was --fullscreen
 ";
 
 fn parse_args() -> Result<Args, String> {
@@ -181,7 +144,6 @@ fn parse_args_from<I: Iterator<Item = String>>(args: I) -> Result<Args, String> 
             "--alpha" => a.alpha = need("--alpha")? == "1",
             "--fullscreen" => a.fullscreen = true,
             "--quiet" => a.quiet = true,
-            "--verbose" => a.verbose = true,
             other if other.starts_with('-') => return Err(format!("unknown option: {}", other)),
             other if pdf.is_none() => pdf = Some(parse_pdf_arg(other)?),
             other => return Err(format!("multiple PDF files are not supported: {}", other)),
@@ -538,45 +500,13 @@ fn run_wayland(a: &Args, doc: &Doc, n_pages: u16) -> ExitCode {
     let mut input = InputState::default();
     // Der Vollbildzustand beim Start ist **das Argument**, nicht die Abfrage:
     // bis zum ersten `configure` hat der Compositor noch nichts gesagt.
-    input.fullscreen_explicit = a.fullscreen;
     input.fullscreen = a.fullscreen;
-    input.fullscreen_origin = if a.fullscreen {
-        Some(Origin::Cli)
-    } else {
-        None
-    };
-    let (has_touch, has_pointer, has_keyboard) = (
-        out.window().has_touch(),
-        out.window().has_pointer(),
-        out.window().has_keyboard(),
-    );
-    input.last_caps_t = has_touch;
-    input.last_caps_p = has_pointer;
-    input.last_caps_k = has_keyboard;
-    input.mode = classify(has_touch, has_pointer, has_keyboard);
-    input.kb_was_present = has_keyboard;
-    input.last_input_ms = out.window().now_ms();
-    if !a.quiet {
-        println!(
-            "  input        {:?}  (touch={} pointer={} keyboard={})",
-            input.mode, has_touch, has_pointer, has_keyboard
-        );
-        if !has_touch {
-            println!(
-                "  input        no touch: no long press, no third-click, \
-                 no fullscreen after {} s",
-                AUTO_FULLSCREEN_MS / 1000.0
-            );
-        }
-        if has_touch && !has_keyboard && !a.fullscreen {
-            println!(
-                "  fullscreen   comes by itself after {} s without input (no keyboard)",
-                AUTO_FULLSCREEN_MS / 1000.0
-            );
-        }
-    }
     let mut menu = Menu::default();
     let mut click_active = false;
+    // Bleibt der Bildschirm wach? Der Shim legt den Inhibitor an, sobald das
+    // Fenster im Vordergrund ist; hier wird nur mitgelesen, damit im
+    // Protokoll steht, was gerade gilt.
+    let mut idle_inhibited = out.window().idle_inhibited();
     let mut click_down_x: i32 = 0;
     let mut click_down_y: i32 = 0;
     let mut click_down_t: f64 = 0.0;
@@ -588,42 +518,8 @@ fn run_wayland(a: &Args, doc: &Doc, n_pages: u16) -> ExitCode {
         // --- Die Fragen, die **kein Ereignis** stellen (vor dem Poll) ---
         let now_ms = out.window().now_ms();
 
-        // 1. Der Sitz kann sich ändern (Tastatur anstecken, Dock abnehmen).
-        {
-            let t = out.window().has_touch();
-            let p = out.window().has_pointer();
-            let k = out.window().has_keyboard();
-            if t != input.last_caps_t || p != input.last_caps_p || k != input.last_caps_k {
-                let alt = input.mode;
-                input.mode = classify(t, p, k);
-                input.last_caps_t = t;
-                input.last_caps_p = p;
-                input.last_caps_k = k;
-                if !a.quiet {
-                    println!(
-                        "  input        {:?} -> {:?}  (touch={} pointer={} keyboard={})",
-                        alt, input.mode, t, p, k
-                    );
-                }
-                // Tastatur angesteckt: das automatische Vollbild war ein
-                // Komfort für die Situation „Tablet in der Hand" — ein
-                // `--fullscreen` auf der Kommandozeile ist kein Widerruf.
-                if !input.kb_was_present && k {
-                    if input.fullscreen_origin == Some(Origin::Auto) {
-                        out.window().set_fullscreen(false);
-                        input.fullscreen = false;
-                        input.fullscreen_origin = None;
-                        if !a.quiet {
-                            println!("  fullscreen   off (keyboard plugged in)");
-                        }
-                    }
-                }
-                input.kb_was_present = k;
-            }
-        }
-
-        // 1b. Was hat der Compositor bestätigt? Nur wenn sich sein Stand
-        //     **geändert** hat, ist das eine Entscheidung von ausserhalb.
+        // 1. Was hat der Compositor bestätigt? Nur wenn sich sein Stand
+        //    **geändert** hat, ist das eine Entscheidung von ausserhalb.
         {
             let fullscreen_now = out.window().is_fullscreen();
             match input.fullscreen_confirmed {
@@ -642,7 +538,6 @@ fn run_wayland(a: &Args, doc: &Doc, n_pages: u16) -> ExitCode {
                 Some(b) if b != fullscreen_now => {
                     input.fullscreen = fullscreen_now;
                     input.fullscreen_confirmed = Some(fullscreen_now);
-                    input.fullscreen_origin = None;
                     if !a.quiet {
                         println!(
                             "  fullscreen   {} (compositor; the request was rejected \
@@ -652,6 +547,27 @@ fn run_wayland(a: &Args, doc: &Doc, n_pages: u16) -> ExitCode {
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // 1c. Wechselt der Vordergrund, wechselt auch die Antwort auf "darf
+        //     der Bildschirm dunkel werden?": Ein Tablet in der Hand soll
+        //     nicht mitten im Satz dunkel werden, ein Fenster hinter dem
+        //     Terminal aber auch niemanden wachhalten.
+        {
+            let inhibited = out.window().idle_inhibited();
+            if inhibited != idle_inhibited {
+                idle_inhibited = inhibited;
+                if !a.quiet {
+                    println!(
+                        "  idle inhibit {}",
+                        if inhibited {
+                            "on (the window is in the foreground)"
+                        } else {
+                            "off (another window is in the foreground)"
+                        }
+                    );
+                }
             }
         }
 
@@ -678,33 +594,7 @@ fn run_wayland(a: &Args, doc: &Doc, n_pages: u16) -> ExitCode {
             }
         }
 
-        // 3. Leerlauf auf einem Tablet: ohne Eingabe 20 Sekunden und keine
-        //    Tastatur — dann wird hier gelesen und niemand denkt an die
-        //    Fensterpappe. Nichts in Bewegung, nichts Neues zu tun.
-        if !input.fullscreen_explicit
-            && !input.fullscreen
-            && out.window().has_touch()
-            && !out.window().has_keyboard()
-            && hold_active.is_none()
-            && !swipe.is_running()
-            && !swipe.is_gliding()
-            && !dirty
-            && in_flight.is_none()
-            && !waiting_for_visible
-            && now_ms - input.last_input_ms >= AUTO_FULLSCREEN_MS
-        {
-            out.window().set_fullscreen(true);
-            input.fullscreen = true;
-            input.fullscreen_origin = Some(Origin::Auto);
-            if !a.quiet {
-                println!(
-                    "  fullscreen   on (idle {:.0} s, no keyboard)",
-                    AUTO_FULLSCREEN_MS / 1000.0
-                );
-            }
-        }
-
-        // 4. Das Menue altert: es ist ein Overlay, kein Zustand.
+        // 3. Das Menue altert: es ist ein Overlay, kein Zustand.
         if menu.open && now_ms - menu.t >= MENU_MS {
             if !a.quiet {
                 println!(
@@ -847,10 +737,6 @@ fn run_wayland(a: &Args, doc: &Doc, n_pages: u16) -> ExitCode {
                     }
                 }
                 event::KEY => {
-                    // Eine Eingabe setzt den Leerlauf-Timer zurück. **Nicht**
-                    // `e.time_ms` (Compositor-Uhr), sondern `now_ms` —
-                    // beide Uhren laufen auseinander.
-                    input.last_input_ms = now_ms;
                     // Eine laufende Gleitbewegung wird von einer Taste
                     // übernommen: erst settle, dann neu begin. Das
                     // Einrasten muss sichtbar werden — am Dokumentrand
@@ -911,7 +797,6 @@ fn run_wayland(a: &Args, doc: &Doc, n_pages: u16) -> ExitCode {
                     }
                 }
                 event::MENU => {
-                    input.last_input_ms = now_ms;
                     if !menu.open {
                         menu = Menu {
                             open: true,
@@ -933,7 +818,6 @@ fn run_wayland(a: &Args, doc: &Doc, n_pages: u16) -> ExitCode {
                     }
                 }
                 event::GESTURE_DOWN | event::GESTURE_MOVE | event::GESTURE_UP => {
-                    input.last_input_ms = now_ms;
                     match e.kind {
                         event::GESTURE_DOWN => {
                             // Das Menue hat Vorrang vor allem anderen: ein
@@ -1012,25 +896,6 @@ fn run_wayland(a: &Args, doc: &Doc, n_pages: u16) -> ExitCode {
                             if rollback {
                                 dirty = true;
                             }
-                            if a.verbose {
-                                println!(
-                                    "  gesture down  x={:<5} y={:<5} slot={:<2} t={:6.1} ms{}",
-                                    e.a,
-                                    e.b,
-                                    e.c,
-                                    e.time_ms,
-                                    match was {
-                                        Touch::New if gesture.discarded() => {
-                                            "  (second finger)"
-                                        }
-                                        Touch::New => "",
-                                        Touch::CatchUp => {
-                                            "  (previous release never arrived - cleaned up)"
-                                        }
-                                        Touch::SecondFinger => "  (second finger)",
-                                    }
-                                );
-                            }
                         }
                         event::GESTURE_MOVE => {
                             // Der Weg seit dem Touch, **aus dem
@@ -1055,7 +920,7 @@ fn run_wayland(a: &Args, doc: &Doc, n_pages: u16) -> ExitCode {
                                 let travel =
                                     swipe.travel(gesture.distance().0, n_pages, &page_rects);
                                 if swipe.drag(gesture.distance().0, travel, n_pages) {
-                                    let (offset_px, _, neighbor_visible) =
+                                    let _ =
                                         swipe.draw(fb, &view, n_pages, &page_rects, spinner.start, Instant::now());
                                     draw_menu(fb, &menu, cw as i32, ch as i32, input.fullscreen);
                                     // **Nicht** `present`: das blockiert bis
@@ -1070,28 +935,7 @@ fn run_wayland(a: &Args, doc: &Doc, n_pages: u16) -> ExitCode {
                                             rc = ExitCode::from(1);
                                         }
                                     }
-                                    if a.verbose {
-                                        println!(
-                                            "  swipe       offset={:<6} neighbor={} {}",
-                                            offset_px,
-                                            match swipe.neighbor(n_pages) {
-                                                Some(n) => format!("page {}", n + 1),
-                                                None => "-".to_string(),
-                                            },
-                                            if neighbor_visible {
-                                                ""
-                                            } else {
-                                                "  (neighbor not in cache: gap stays paper)"
-                                            }
-                                        );
-                                    }
                                 }
-                            }
-                            if a.verbose {
-                                println!(
-                                    "  gesture drag  x={:<5} y={:<5} slot={:<2} t={:6.1} ms",
-                                    e.a, e.b, e.c, e.time_ms
-                                );
                             }
                         }
                         _ => {
@@ -1156,8 +1000,6 @@ fn run_wayland(a: &Args, doc: &Doc, n_pages: u16) -> ExitCode {
                                     continue;
                                 }
                             }
-                            let (dx, dy, duration) = gesture.summary(e.time_ms);
-
                             // Wurde wirklich von der Ausgangsposition weg
                             // gezogen?
                             let moved = swipe.offset().abs() > 1e-6;
@@ -1191,23 +1033,6 @@ fn run_wayland(a: &Args, doc: &Doc, n_pages: u16) -> ExitCode {
                                 swipe.release(target_offset, GLIDE_MS);
                             }
 
-                            let action = match change {
-                                Some(t) => t,
-                                None if moved => "  (pull back animated)",
-                                _ => "  (no movement)",
-                            };
-                            if a.verbose {
-                                println!(
-                                    "  gesture up    dx={:<6} dy={:<6} duration={:6.1} ms {}",
-                                    dx, dy, duration, action
-                                );
-                            }
-                            if a.verbose && swipe.is_gliding() {
-                                println!(
-                                    "  glide        target_offset={:<4} duration={} ms",
-                                    target_offset, GLIDE_MS as i32
-                                );
-                            }
                             if !swipe.is_gliding() {
                                 if change.is_some() || moved {
                                     dirty = true;
@@ -1223,20 +1048,6 @@ fn run_wayland(a: &Args, doc: &Doc, n_pages: u16) -> ExitCode {
                                 pending_events = n - r;
                                 break;
                             }
-                        }
-                    }
-                }
-                event::FRAME => {
-                    if a.verbose {
-                        // b: 0 = angezeigt, 1 = nie angezeigt (verdeckt),
-                        // 2 = fremde Uhr.
-                        match e.b {
-                            0 => println!(
-                                "  on panel      t={:7.1} ms  flags={:#05x}",
-                                e.time_ms, e.a
-                            ),
-                            1 => println!("  not shown (discarded)"),
-                            _ => println!("  time unusable (foreign clock)"),
                         }
                     }
                 }
@@ -1256,12 +1067,16 @@ fn run_wayland(a: &Args, doc: &Doc, n_pages: u16) -> ExitCode {
                     Some(v) => println!("  wp_presentation  v{} (feedback active)", v),
                     None => println!("  wp_presentation  absent"),
                 }
+                match out.window().wants("zwp_idle_inhibit_manager_v1") {
+                    Some(v) => println!(
+                        "  idle inhibit     v{} (the screen stays on in the foreground)",
+                        v
+                    ),
+                    None => println!("  idle inhibit     absent (the screen may dim)"),
+                }
                 println!("  Keys         ← → ↑ ↓ PgUp/PgDn Space = flip, F = fullscreen, Q/Escape = quit");
                 println!("  Touch        Swipe = flip, long press (500 ms) = menu");
                 println!("  Mouse        Drag = flip, click left/right third = back/forward, right click = menu");
-                if has_touch && !has_keyboard {
-                    println!("  fullscreen   comes by itself after {} s without input (no keyboard)", AUTO_FULLSCREEN_MS as i32 / 1000);
-                }
             }
         }
 
@@ -1306,7 +1121,7 @@ fn run_wayland(a: &Args, doc: &Doc, n_pages: u16) -> ExitCode {
             spinner_tick = false;
 
             let fb = ensure_buffer(&mut buffer, a.alpha, cw, ch);
-            let (offset_px, done, _neighbor_visible) =
+            let (_, done, _) =
                 swipe.draw(fb, &view, n_pages, &page_rects, spinner.start, Instant::now());
             draw_menu(fb, &menu, cw as i32, ch as i32, input.fullscreen);
             match out.present_nonblocking(fb) {
@@ -1316,18 +1131,6 @@ fn run_wayland(a: &Args, doc: &Doc, n_pages: u16) -> ExitCode {
                     rc = ExitCode::from(1);
                     break;
                 }
-            }
-            if a.verbose {
-                println!(
-                    "  offset      offset={:<6} neighbor={} {}{}",
-                    offset_px,
-                    match swipe.neighbor(n_pages) {
-                        Some(n) => format!("page {}", n + 1),
-                        None => "-".to_string(),
-                    },
-                    if swipe.is_gliding() { "  (glide)" } else { "" },
-                    if done { "  (done)" } else { "" }
-                );
             }
             if done {
                 // Eingerastet. War `page` inzwischen geändert, war es ein
@@ -1591,18 +1394,6 @@ mod tests {
         assert_eq!(poll_timeout_ms(false, false, false, false, false, false), 100);
     }
 
-    /// **Nur ein Finger und keine Maus** heißen „Tablet".
-    #[test]
-    fn the_input_mode_is_a_table_not_a_guess() {
-        assert_eq!(classify(false, true, true), InputMode::Desktop);
-        assert_eq!(classify(true, false, false), InputMode::TabletOnly);
-        assert_eq!(classify(true, true, true), InputMode::Hybrid);
-        assert_eq!(classify(true, false, true), InputMode::Hybrid);
-        assert_eq!(classify(true, true, false), InputMode::Hybrid);
-        assert_eq!(classify(false, false, true), InputMode::Desktop);
-        assert_eq!(classify(false, false, false), InputMode::Desktop);
-    }
-
     /// Das Drittel ist **eine Zahl**: links zurück, rechts vor, die Mitte
     /// gehört niemandem. Grenze `breite / 3` ohne Rundung.
     #[test]
@@ -1724,19 +1515,14 @@ mod tests {
         assert_eq!(h, a.size.1);
     }
 
-    /// `--quiet` und `--verbose` sind zwei Lautstärken nebeneinander.
+    /// `--quiet` unterdrückt die Ausgabe.
     #[test]
-    fn quiet_and_verbose_are_parsed() {
+    fn quiet_is_parsed() {
         let quiet = parse_args_from(
             ["/tmp/a.pdf".to_string(), "--quiet".to_string()].into_iter(),
         )
         .unwrap();
-        assert!(quiet.quiet && !quiet.verbose);
-        let verbose = parse_args_from(
-            ["/tmp/a.pdf".to_string(), "--verbose".to_string()].into_iter(),
-        )
-        .unwrap();
-        assert!(verbose.verbose && !verbose.quiet);
+        assert!(quiet.quiet);
     }
 
     /// Die Hilfe muss dieselben Zeiten nennen, die der Code wählt.
@@ -1759,10 +1545,6 @@ mod tests {
             digits
         };
         assert_eq!(number("long press"), (HOLD_MS as i64).to_string());
-        assert_eq!(
-            number("without input"),
-            ((AUTO_FULLSCREEN_MS / 1000.0) as i64).to_string()
-        );
         assert!(
             MENU_MS > 1000.0 && MENU_MS < HOLD_MS * 10.0,
             "the menu must be survivable, but not forever: {} ms",
@@ -1845,11 +1627,11 @@ mod tests {
 
     #[test]
     fn path_uri_and_relative_are_the_same_path() {
-        let expected = PathBuf::from("/home/arne/Dokumente/score.pdf");
+        let expected = PathBuf::from("/home/user/Dokumente/score.pdf");
         for arg in [
-            "/home/arne/Dokumente/score.pdf",
-            "file:///home/arne/Dokumente/score.pdf",
-            "file://localhost/home/arne/Dokumente/score.pdf",
+            "/home/user/Dokumente/score.pdf",
+            "file:///home/user/Dokumente/score.pdf",
+            "file://localhost/home/user/Dokumente/score.pdf",
         ] {
             assert_eq!(parse_pdf_arg(arg).unwrap(), expected, "at {}", arg);
         }
@@ -1927,10 +1709,6 @@ const CLICK_TRAVEL: i32 = 10;
 
 /// Wie lange das Menue offen bleibt, ohne dass etwas passiert.
 const MENU_MS: f64 = 3000.0;
-
-/// Wie lange ohne Eingabe vergehen muessen, bis ein Tablet in den
-/// Vollbildmodus geht (nur wenn keine Tastatur da ist).
-const AUTO_FULLSCREEN_MS: f64 = 20_000.0;
 
 /// Was ein Klick (Maus) in diesem X-Bereich tut: links zurück, rechts vor,
 /// die Mitte dazwischen gehört niemandem. Reine Funktion ohne Fenster und
@@ -2018,48 +1796,17 @@ fn menu_glyph(fb: &mut FrameBuffer, panel: IRect, voll: bool) {
     fb.fill_rect(IRect::new(x1 - length, y1 - thickness, x1, y1), EDGE);
 }
 
-/// Schaltet das Vollbild um und merkt sich, dass **wir** es getan haben —
-/// beim Anstecken einer Tastatur darf nur das automatische Vollbild
-/// verschwinden, und der Leerlauf-Timer darf nicht ein zweites Mal anklopfen.
-/// Geschaltet wird nach `input.fullscreen`, nicht nach dem, was der Compositor
-/// zuletzt gemeldet hat.
+/// Schaltet das Vollbild um. Geschaltet wird nach `input.fullscreen`, nicht
+/// nach dem, was der Compositor zuletzt gemeldet hat.
 fn toggle_fullscreen(out: &mut Wayland, input: &mut InputState, a: &Args) {
     let now = input.fullscreen;
     let requested = !now;
     out.window().set_fullscreen(requested);
     input.fullscreen = requested;
-    // `fullscreen_confirmed` bleibt absichtlich stehen: ändert sich der Stand
-    // des Compositors daraufhin, ist das seine Antwort.
-    input.fullscreen_origin = if requested {
-        Some(Origin::Menu)
-    } else {
-        // Wir verlassen das Vollbild: der Leerlauf darf es später wieder
-        // aufbauen.
-        None
-    };
-    // `--fullscreen` war ein Startzustand.
-    input.fullscreen_explicit = requested;
     if !a.quiet {
         println!(
             "  fullscreen   {}",
             if !now { "on (requested)" } else { "off" }
         );
-    }
-}
-
-/// Was das Vollbild veranlasst hat — „der Nutzer hat es so gewollt" oder
-/// „nur ein Komfort".
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Origin {
-    Cli,
-    Auto,
-    Menu,
-}
-
-fn classify(t: bool, p: bool, k: bool) -> InputMode {
-    match (t, p, k) {
-        (true, false, false) => InputMode::TabletOnly,
-        (true, _, _) => InputMode::Hybrid,
-        _ => InputMode::Desktop,
     }
 }

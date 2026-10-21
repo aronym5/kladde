@@ -100,6 +100,7 @@ mod ffi {
         pub fn kl_wl_has_touch(h: *mut c_void) -> c_int;
         pub fn kl_wl_has_pointer(h: *mut c_void) -> c_int;
         pub fn kl_wl_has_keyboard(h: *mut c_void) -> c_int;
+        pub fn kl_wl_idle_inhibited(h: *mut c_void) -> c_int;
         pub fn kl_wl_last_error(h: *mut c_void) -> *const c_char;
     }
 }
@@ -181,6 +182,9 @@ mod ffi {
         0
     }
     pub unsafe fn kl_wl_has_keyboard(_h: *mut c_void) -> c_int {
+        0
+    }
+    pub unsafe fn kl_wl_idle_inhibited(_h: *mut c_void) -> c_int {
         0
     }
     pub unsafe fn kl_wl_last_error(_h: *mut c_void) -> *const c_char {
@@ -343,6 +347,16 @@ impl Window {
 
     pub fn has_keyboard(&self) -> bool {
         unsafe { ffi::kl_wl_has_keyboard(self.h) != 0 }
+    }
+
+    /// Is the screen currently kept from dimming and blanking? The shim
+    /// creates and destroys the inhibitor with the window's foreground
+    /// state - the compositor's `activated` state or the keyboard focus
+    /// (see `update_idle_inhibit()` in `shim/kladde_wl.c`); `false`
+    /// therefore also means "the compositor does not offer the protocol"
+    /// or "another window is in the foreground".
+    pub fn idle_inhibited(&self) -> bool {
+        unsafe { ffi::kl_wl_idle_inhibited(self.h) != 0 }
     }
 
     /// Back buffer for `w x h` pixels. Returns pointer, stride (bytes per

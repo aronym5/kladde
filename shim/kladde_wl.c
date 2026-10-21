@@ -60,6 +60,16 @@
 #define KL_HAVE_DECORATION 1
 #endif
 
+/* The idle inhibitor (the screen must not dim or blank while a page is
+ * shown) is optional in two ways: the compositor does not have to offer
+ * zwp_idle_inhibit_manager_v1, and not every wayland-protocols
+ * installation ships the XML of the unstable protocol. Without the
+ * header Kladde builds and behaves as before. */
+#if __has_include("idle-inhibit-unstable-v1-client-protocol.h")
+#include "idle-inhibit-unstable-v1-client-protocol.h"
+#define KL_HAVE_IDLE_INHIBIT 1
+#endif
+
 #include "kladde_wl.h"
 
 #define KL_NBUF 2
@@ -84,6 +94,13 @@ struct kl_wl {
     struct zxdg_decoration_manager_v1 *deco_mgr;
     struct zxdg_toplevel_decoration_v1 *decoration;
 #endif
+#ifdef KL_HAVE_IDLE_INHIBIT
+    /* "Do not dim the screen while this window is in the foreground." The
+     * inhibitor hangs on the surface; see update_idle_inhibit() for when
+     * it is created and destroyed. */
+    struct zwp_idle_inhibit_manager_v1 *idle_mgr;
+    struct zwp_idle_inhibitor_v1 *inhibitor;
+#endif
     struct wl_surface *surface;
 
     struct wl_seat *seat;
@@ -97,6 +114,7 @@ struct kl_wl {
     int v_wm_base;
     int v_seat;
     int v_presentation;
+    int v_idle;              /* a version < 0 means: not offered */
     struct wp_presentation *pres;
     uint32_t clk_id;        /* reported by clock_id, see below */
     int clk_known;
@@ -132,6 +150,13 @@ struct kl_wl {
      * again, even if the size has not moved. */
     int rw, rh;
 
+    /* Is the window in the foreground? Two things answer that, and
+     * neither of them is the keyboard's business - see
+     * update_idle_inhibit() for the rule that reads them. */
+    int front;           /* the keyboard focus is here: yes / no */
+    int front_known;     /* did the keyboard ever say anything? */
+    int activated;       /* does the last configure carry ACTIVATED? */
+    int activated_seen;  /* did a configure ever carry ACTIVATED? */
     /* Gesture */
     int pointer_down;
     double last_x, last_y;
@@ -226,6 +251,10 @@ static const struct wl_pointer_listener pointer_listener;
 static const struct wl_keyboard_listener keyboard_listener;
 static const struct wp_presentation_listener pres_listener;
 static const struct wp_presentation_feedback_listener fb_listener;
+
+/* Defined below with the foreground rule; the registry, the keyboard
+ * handlers and the toplevel configure need it before that. */
+static void update_idle_inhibit(struct kl_wl *w);
 
 /* ---- Buffers ------------------------------------------------------ */
 
@@ -353,6 +382,18 @@ static void registry_global(void *data, struct wl_registry *r, uint32_t name,
                 r, name, &zxdg_decoration_manager_v1_interface, 1);
     }
 #endif
+#ifdef KL_HAVE_IDLE_INHIBIT
+    else if (strcmp(iface, "zwp_idle_inhibit_manager_v1") == 0) {
+        if (!w->idle_mgr) {
+            w->v_idle = (int)ver;
+            w->idle_mgr = wl_registry_bind(
+                r, name, &zwp_idle_inhibit_manager_v1_interface, 1);
+            /* The surface may not exist yet; the inhibitor then follows in
+             * setup_surface(). */
+            update_idle_inhibit(w);
+        }
+    }
+#endif
 }
 
 static void registry_remove(void *data, struct wl_registry *r, uint32_t name) {
@@ -387,6 +428,15 @@ static void toplevel_configure(void *data, struct xdg_toplevel *t,
     /* The fullscreen state lives in the configure and **nowhere else**:
      * a request is a plea, only the compositor decides. */
     w->fullscreen = array_has(XDG_TOPLEVEL_STATE_FULLSCREEN, states);
+
+    /* "The surface is now activated" - the compositor's own word on
+     * which window is in front, and the one statement that does not
+     * need a keyboard (see update_idle_inhibit()). The deactivation
+     * arrives the same way, as a configure **without** the state. */
+    w->activated = array_has(XDG_TOPLEVEL_STATE_ACTIVATED, states);
+    if (w->activated)
+        w->activated_seen = 1;
+    update_idle_inhibit(w);
 
     /* 0 x 0 means "we decide ourselves": the compositor has no
      * geometry for this window - exactly what happens when the window
@@ -626,19 +676,29 @@ static void keyboard_keymap(void *data, struct wl_keyboard *k, uint32_t format,
 
 static void keyboard_enter(void *data, struct wl_keyboard *k, uint32_t serial,
                            struct wl_surface *surface, struct wl_array *keys) {
-    (void)data;
+    struct kl_wl *w = data;
     (void)k;
     (void)serial;
     (void)surface;
     (void)keys;
+    /* The keyboard focus is one of the two statements about the
+     * foreground - the other is the toplevel's `activated` state, which
+     * a tablet without a keyboard still gets (see
+     * update_idle_inhibit()). */
+    w->front_known = 1;
+    w->front = 1;
+    update_idle_inhibit(w);
 }
 
 static void keyboard_leave(void *data, struct wl_keyboard *k, uint32_t serial,
                            struct wl_surface *surface) {
-    (void)data;
+    struct kl_wl *w = data;
     (void)k;
     (void)serial;
     (void)surface;
+    w->front_known = 1;
+    w->front = 0;
+    update_idle_inhibit(w);
 }
 
 static void keyboard_key(void *data, struct wl_keyboard *k, uint32_t serial,
@@ -670,6 +730,120 @@ static void keyboard_repeat_info(void *data, struct wl_keyboard *k,
     (void)rate;
     (void)delay;
 }
+
+/* ---- Idle inhibit: the screen stays on ---------------------------------
+ *
+ * While a page is on screen, the display must neither dim nor blank: the
+ * page **is** the point, and a dimmed page has to be woken up again -
+ * during a rehearsal that is exactly the wrong moment. The wish is one
+ * protocol request (zwp_idle_inhibit_manager_v1, called "unstable" but
+ * implemented by every compositor worth naming: KWin, Mutter, Sway,
+ * Hyprland, Weston, phoc).
+ *
+ * Two rules shape what happens here:
+ *
+ * 1. The compositor already owns the visibility. The protocol says: "If
+ *    the surface is destroyed, unmapped, becomes occluded, loses
+ *    visibility, or otherwise becomes not visually relevant for the
+ *    user, the idle inhibitor will not be honored". A covered or
+ *    iconified window therefore keeps nobody awake, without us doing
+ *    anything.
+ *
+ * 2. What stays is the window that is visible and yet **not in front**.
+ *    Which window is in front is a question about windows, not about
+ *    devices: a tablet switches windows with a finger just as a desktop
+ *    does with a keyboard, and a window that lost the front there must
+ *    let the screen dim again. Two statements answer the question:
+ *
+ *    - the `activated` state of the toplevel in xdg_toplevel.configure:
+ *      the compositor's own word on the active window, and one it can
+ *      make without a keyboard. The state carries no `since` in
+ *      xdg-shell, so it is part of version 1 - the binding stays as it
+ *      is, and a compositor that knows the state sends it.
+ *    - the keyboard focus (wl_keyboard.enter/leave), which most
+ *      compositors move exactly with the activation.
+ *
+ *    Either statement saying "in front" counts as an answer; whomever we
+ *    ask, we never get two contradictory ones in practice.
+ *
+ *    Turning the inhibitor off needs a statement as well: a signal that
+ *    never came is not a signal. That is what `activated_seen` and
+ *    `front_known` are for. A compositor whose window management does
+ *    not deal in activation never grants ACTIVATED, so it never
+ *    withdraws it either - without the bit the missing state would read
+ *    as "you are behind", and that is exactly the tablet the wish was
+ *    made for. So the window counts as in front until someone says
+ *    otherwise, and rule 1 keeps an invisible window from keeping
+ *    anybody awake anyway.
+ * --------------------------------------------------------------------- */
+
+#ifdef KL_HAVE_IDLE_INHIBIT
+
+/* Is the window in front - and who says so? `why` names the statement
+ * for the verbose log: without it a log line reading "idle inhibit off"
+ * leaves the reader guessing which of the two statements did it. */
+static int in_foreground(const struct kl_wl *w, const char **why) {
+    if (w->activated) {
+        *why = "the compositor calls the window active";
+        return 1;
+    }
+    if (w->front_known && w->front) {
+        *why = "the keyboard focus is here";
+        return 1;
+    }
+    if (w->activated_seen) {
+        *why = "the compositor calls another window active";
+        return 0;
+    }
+    if (w->front_known) {
+        *why = "the keyboard focus moved away";
+        return 0;
+    }
+    *why = "no word about the foreground";
+    return 1;
+}
+
+static void update_idle_inhibit(struct kl_wl *w) {
+    const char *why = "?";
+    int want;
+
+    if (!w->idle_mgr || !w->surface)
+        return;
+    want = in_foreground(w, &why);
+    if (want == (w->inhibitor != NULL))
+        return; /* nothing changed: no request, no flush */
+
+    if (want) {
+        w->inhibitor = zwp_idle_inhibit_manager_v1_create_inhibitor(
+            w->idle_mgr, w->surface);
+        if (!w->inhibitor) {
+            set_err(w, "could not create the idle inhibitor");
+            return;
+        }
+    } else {
+        zwp_idle_inhibitor_v1_destroy(w->inhibitor);
+        w->inhibitor = NULL;
+    }
+    if (w->verbose)
+        fprintf(stderr, "[kladde/wl] idle inhibit %s (%s)\n",
+                want ? "on" : "off", why);
+
+    /* The request goes out now and not "sometime with the next frame":
+     * exactly while the screen is idle no commit follows to carry it
+     * along. EAGAIN means "kernel buffer full", not "error" - the next
+     * kl_wl_poll takes over (same reasoning as in
+     * kl_wl_set_fullscreen). */
+    if (w->display && wl_display_flush(w->display) < 0 && errno != EAGAIN)
+        set_errf(w, "failed to send the idle inhibit request: %s",
+                 strerror(errno));
+}
+
+#else
+
+/* No header, no wish: the callers stay free of #ifdef. */
+static void update_idle_inhibit(struct kl_wl *w) { (void)w; }
+
+#endif
 
 /* ---- wp_presentation ------------------------------------------------
  * Here stands the point in time when the image *really* was on the
@@ -934,6 +1108,12 @@ static int setup_surface(struct kl_wl *w) {
     }
     w->surface_version = wl_proxy_get_version((struct wl_proxy *)w->surface);
 
+    /* From here on the display stays awake while this window is in front -
+     * early, so that the screen cannot start to dim between the first
+     * frame and the first statement about the foreground (see
+     * update_idle_inhibit()). */
+    update_idle_inhibit(w);
+
     w->xdg_surface = xdg_wm_base_get_xdg_surface(w->wm_base, w->surface);
     if (!w->xdg_surface) {
         set_err(w, "xdg_wm_base_get_xdg_surface failed");
@@ -985,6 +1165,11 @@ kl_wl *kl_wl_open(const char *title, int w, int h, int fullscreen,
         wl->fd[i] = -1;
     wl->verbose = getenv("KL_WL_VERBOSE") != NULL;
     wl->base_ms = now_ms();
+    /* "Not bound" is not "version 0": a protocol the compositor does not
+     * offer has to stay "not there" for kl_wl_want() - calloc would leave
+     * 0, which reads as "offered". */
+    wl->v_compositor = wl->v_shm = wl->v_wm_base = -1;
+    wl->v_seat = wl->v_presentation = wl->v_idle = -1;
     /* The client's wish sits in the shim from the start: without it a
      * `configure(0, 0)` has nothing to fall back on. */
     wl->dw = w > 0 ? w : 0;
@@ -1082,9 +1267,10 @@ kl_wl *kl_wl_open(const char *title, int w, int h, int fullscreen,
     if (wl->verbose)
         fprintf(stderr,
                 "[kladde/wl] compositor v%d shm v%d wm_base v%d seat v%d "
-                "presentation v%d surface v%d window %dx%d configured=%d\n",
+                "presentation v%d idle v%d surface v%d window %dx%d configured=%d\n",
                 wl->v_compositor, wl->v_shm, wl->v_wm_base, wl->v_seat,
-                wl->v_presentation, wl->surface_version, w, h, wl->configured);
+                wl->v_presentation, wl->v_idle, wl->surface_version, w, h,
+                wl->configured);
 
     return wl;
 
@@ -1104,6 +1290,16 @@ void kl_wl_drop(kl_wl *w) {
             xdg_toplevel_destroy(w->toplevel);
         if (w->xdg_surface)
             xdg_surface_destroy(w->xdg_surface);
+#ifdef KL_HAVE_IDLE_INHIBIT
+        /* wl_proxy_destroy, not the destroy request: the connection goes
+         * down a few lines further anyway (see the header comment on
+         * cleanup). The surface is destroyed after this, as it carries
+         * the inhibitor. */
+        if (w->inhibitor)
+            wl_proxy_destroy((struct wl_proxy *)w->inhibitor);
+        if (w->idle_mgr)
+            wl_proxy_destroy((struct wl_proxy *)w->idle_mgr);
+#endif
         if (w->surface)
             wl_surface_destroy(w->surface);
         /* See the header comment: wl_proxy_destroy, not release. */
@@ -1150,6 +1346,8 @@ int kl_wl_want(kl_wl *w, const char *iface, int *version) {
         v = w->v_seat;
     else if (strcmp(iface, "wp_presentation") == 0)
         v = w->v_presentation;
+    else if (strcmp(iface, "zwp_idle_inhibit_manager_v1") == 0)
+        v = w->v_idle;
     else
         v = -1;
     if (version)
@@ -1371,6 +1569,18 @@ int kl_wl_has_pointer(const kl_wl *w) {
 
 int kl_wl_has_keyboard(const kl_wl *w) {
     return w && w->keyboard != NULL;
+}
+
+/* Is the screen kept from dimming right now? 0 also covers "the
+ * compositor has no such protocol" and "the window is not in the
+ * foreground" - both mean: the display behaves as usual. */
+int kl_wl_idle_inhibited(const kl_wl *w) {
+#ifdef KL_HAVE_IDLE_INHIBIT
+    return w != NULL && w->inhibitor != NULL;
+#else
+    (void)w;
+    return 0;
+#endif
 }
 
 const char *kl_wl_last_error(kl_wl *w) {
