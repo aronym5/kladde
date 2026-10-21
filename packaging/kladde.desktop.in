@@ -2,7 +2,7 @@
 Type=Application
 Name=Kladde
 Comment=PDF-Betrachter
-# @KLADDE@ wird von packaging/install-user.sh durch den absoluten Pfad ersetzt.
+# @KLADDE@ is replaced by the absolute path to the binary by packaging/install.sh
 Exec=@KLADDE@ --fullscreen %f
 Icon=kladde
 Terminal=false

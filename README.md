@@ -96,36 +96,34 @@ cargo run --release --bin kladde -- score.pdf
 A running Wayland session is required (`WAYLAND_DISPLAY`); without one
 kladde explains why.
 
-For a desktop or a phone, the bundled script installs everything for the
-current user, without root and without touching system paths:
+For a desktop, a laptop or a phone, one script installs everything:
+binary, desktop file, icon and license.
 
 ```sh
-./packaging/install-user.sh              # builds the release binary and installs it
-./packaging/install-user.sh pfad/kladde  # or install a binary you built yourself
+./packaging/install.sh              # for me: builds and installs to ~/.local
+sudo ./packaging/install.sh         # system-wide: builds and installs to /usr/local
+./packaging/install.sh --static     # same, but as one self-contained binary
+./packaging/install.sh path/kladde  # skip the build, install a binary you made
 ```
 
-It copies the binary to `~/.local/bin/kladde`, the icon and the desktop
-file into the XDG directories, and registers kladde as the default handler
-for PDFs. The desktop entry starts kladde with `--fullscreen`.
+Without root the target is `~/.local`, as root it is `/usr/local`. A desktop file added
+for handling PDF files from the desktop manager. The script registers kladde as the
+default handler for PDFs - as root for the user behind `sudo`, not for
+root itself. `--no-default` leaves the existing handler alone;
+`--prefix DIR` and `DESTDIR=DIR` are there for packaging, the second one
+writes the files without registering anything.
 
 ### Static build
 
 By default `.cargo/config.toml` links dynamically against the shared
 `libmupdf.so` of the distribution. For a single-file binary (recommended
-for the final device), remove `.cargo/config.toml` and provide a static
-`libmupdf.a`, e.g.:
+for better portability) `packaging/build-static.sh` does the whole job -
+MuPDF and Wayland from source, then kladde, all into `target/static`:
 
 ```sh
-curl -O https://mupdf.com/downloads/archive/mupdf-1.27.2-source.tar.gz
-tar xzf mupdf-1.27.2-source.tar.gz && cd mupdf-1.27.2-source
-make HAVE_X11=no HAVE_GLUT=no HAVE_COBOL=no HAVE_OBJC=no libs
-sudo make install prefix=/usr/local
-KLADDE_MUPDF_PREFIX=/usr/local cargo build --release
+./packaging/install.sh --static     # build and install in one step
+./packaging/build-static.sh         # or only build: target/release/kladde-linux-<arch>
 ```
-
-`build.rs` finds MuPDF in `/usr`, `/usr/local`, `/opt/mupdf` or
-`/opt/local`, or via `KLADDE_MUPDF_PREFIX` / `KLADDE_MUPDF_INCLUDE` /
-`KLADDE_MUPDF_LIB`.
 
 ### Stub mode (no MuPDF, no Wayland)
 
