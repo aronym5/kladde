@@ -210,4 +210,16 @@ KLADDE_MUPDF=stub cargo test
 
 ## License
 
-AGPL-3.0-or-later.
+Copyright (C) 2026 aronym5
+
+Kladde is free software: you can redistribute it and/or modify it under the
+terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option)
+any later version.
+
+Kladde is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for
+more details.
+
+The full license text is in [LICENSE](LICENSE).
